@@ -106,30 +106,46 @@ app.get('/api/tiktok', async (req, res) => {
 });
 
 // ========== YOUTUBE FALLBACK (Invidious API) ==========
+// ========== YOUTUBE FALLBACK (Multiple Invidious instances) ==========
+const invidiousInstances = [
+    'https://vid.puffyan.us',
+    'https://invidious.snopyta.org',
+    'https://invidious.fdn.fr',
+    'https://yewtu.be',
+    'https://invidious.nerdvpn.de',
+];
+
 app.get('/api/youtube', async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).json({ error: 'URL required' });
+
     const idMatch = url.match(/(?:v=|\/)([a-zA-Z0-9_-]{11})(?:&|$|\/|\.)/) || url.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
     if (!idMatch) return res.status(400).json({ error: 'Invalid YouTube URL' });
     const videoId = idMatch[1];
-    try {
-        const apiUrl = `https://invidious.snopyta.org/api/v1/videos/${videoId}`;
-        const response = await fetch(apiUrl);
-        if (!response.ok) throw new Error('Invidious API error');
-        const data = await response.json();
-        const format = data.formatStreams
-            ?.filter(f => f.container === 'mp4' && f.audioChannels > 0)
-            ?.sort((a, b) => (b.width || 0) - (a.width || 0))[0];
-        if (!format) throw new Error('No suitable download format');
-        res.json({
-            title: data.title,
-            thumbnail: data.videoThumbnails?.[0]?.url || '',
-            duration: `${Math.floor(data.lengthSeconds / 60)}:${String(data.lengthSeconds % 60).padStart(2, '0')}`,
-            downloadUrl: format.url
-        });
-    } catch (err) {
-        res.status(500).json({ error: 'YouTube fallback failed: ' + err.message });
+
+    let lastError;
+    for (const instance of invidiousInstances) {
+        try {
+            const apiUrl = `${instance}/api/v1/videos/${videoId}`;
+            const response = await fetch(apiUrl);
+            if (!response.ok) continue; // try next instance
+            const data = await response.json();
+            const format = data.formatStreams
+                ?.filter(f => f.container === 'mp4' && f.audioChannels > 0)
+                ?.sort((a, b) => (b.width || 0) - (a.width || 0))[0];
+            if (!format) continue;
+            res.json({
+                title: data.title,
+                thumbnail: data.videoThumbnails?.[0]?.url || '',
+                duration: `${Math.floor(data.lengthSeconds / 60)}:${String(data.lengthSeconds % 60).padStart(2, '0')}`,
+                downloadUrl: format.url,
+            });
+            return; // success
+        } catch (err) {
+            lastError = err.message;
+        }
     }
+    res.status(500).json({ error: 'All Invidious instances failed: ' + lastError });
 });
 
 // ========== START SERVER ==========
