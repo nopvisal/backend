@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const { execFile } = require('child_process');
+const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -8,17 +9,26 @@ app.use(cors());
 app.use(express.json());
 app.get('/', (req, res) => res.send('MediaForge backend is running'));
 
-// ---------- yt-dlp helper (for Facebook – no proxy) ----------
+// Write cookies if present
+if (process.env.YOUTUBE_COOKIES) {
+    fs.writeFileSync('./cookies.txt', process.env.YOUTUBE_COOKIES);
+    console.log('Cookies file written');
+}
+
+// ---------- yt-dlp helper (uses cookies, no proxy) ----------
 function ytDlp(args) {
     return new Promise((resolve, reject) => {
         const ytDlpPath = './yt-dlp';
         const fullArgs = [
             '--no-warnings', '--no-playlist',
             '--socket-timeout', '20',
-            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            ...args
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         ];
-        execFile(ytDlpPath, fullArgs, { timeout: 20000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (fs.existsSync('./cookies.txt')) {
+            fullArgs.push('--cookies', './cookies.txt');
+        }
+        fullArgs.push(...args);
+        execFile(ytDlpPath, fullArgs, { timeout: 25000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
             if (err) return reject(new Error(stderr || err.message));
             resolve(stdout.trim());
         });
@@ -26,7 +36,7 @@ function ytDlp(args) {
 }
 
 // ---------- Fetch with timeout ----------
-function fetchWithTimeout(url, options = {}, timeout = 8000) {
+function fetchWithTimeout(url, options = {}, timeout = 15000) {
     return new Promise((resolve, reject) => {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeout);
@@ -36,74 +46,28 @@ function fetchWithTimeout(url, options = {}, timeout = 8000) {
     });
 }
 
-// ---------- YouTube API cascade ----------
-const youtubeAPIs = [
-    {
-        name: 'lucash.dev',
-        fn: async (url) => {
-            const apiUrl = `https://api.lucash.dev/video?url=${encodeURIComponent(url)}`;
-            const resp = await fetchWithTimeout(apiUrl);
-            if (!resp.ok) return null;
-            const data = await resp.json();
-            if (data.error || !data.download_url) return null;
-            return { title: data.title, thumbnail: data.thumbnail, downloadUrl: data.download_url };
-        }
-    },
-    {
-        name: 'loader.to',
-        fn: async (url) => {
-            const apiUrl = `https://loader.to/api/card/?url=${encodeURIComponent(url)}`;
-            const resp = await fetchWithTimeout(apiUrl);
-            if (!resp.ok) return null;
-            const data = await resp.json();
-            if (!data.download_url) return null;
-            return { title: data.title, thumbnail: data.thumbnail, downloadUrl: data.download_url };
-        }
-    },
-    {
-        name: 'Cobalt',
-        fn: async (url) => {
-            const body = JSON.stringify({ url, filenamePattern: 'basic', videoQuality: '720' });
-            const resp = await fetchWithTimeout('https://api.cobalt.tools/api/json', {
-                method: 'POST',
-                headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-                body,
-            });
-            const data = await resp.json();
-            if (!data.url) return null;
-            let title = 'YouTube Video', thumbnail = '';
-            const idMatch = url.match(/(?:v=|\/)([a-zA-Z0-9_-]{11})(?:&|$|\/|\.)/) || url.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
-            if (idMatch) {
-                thumbnail = `https://img.youtube.com/vi/${idMatch[1]}/hqdefault.jpg`;
-                try {
-                    const oembed = await fetchWithTimeout(`https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`);
-                    if (oembed.ok) {
-                        const o = await oembed.json();
-                        title = o.title; thumbnail = o.thumbnail_url || thumbnail;
-                    }
-                } catch (e) {}
-            }
-            return { title, thumbnail, downloadUrl: data.url };
-        }
-    }
-];
-
-// ---------- YouTube endpoint ----------
+// ---------- YouTube ----------
 app.get('/api/youtube', async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).json({ error: 'URL required' });
-
-    for (const api of youtubeAPIs) {
-        try {
-            console.log(`Trying ${api.name}...`);
-            const result = await api.fn(url);
-            if (result) return res.json(result);
-        } catch (e) {
-            console.warn(`${api.name} failed:`, e.message);
-        }
+    try {
+        const json = await ytDlp(['--dump-single-json', url]);
+        const info = JSON.parse(json);
+        const formats = (info.formats || [])
+            .filter(f => f.vcodec !== 'none' && f.acodec !== 'none' && f.ext === 'mp4')
+            .sort((a, b) => (b.height || 0) - (a.height || 0));
+        if (formats.length === 0) throw new Error('No downloadable format');
+        const directUrl = await ytDlp(['-f', formats[0].format_id, '-g', url]);
+        res.json({
+            title: info.title,
+            thumbnail: info.thumbnail,
+            duration: info.duration_string,
+            quality: formats[0].height ? `${formats[0].height}p` : 'Unknown',
+            downloadUrl: directUrl,
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
-
-    res.status(500).json({ error: 'All YouTube APIs failed. Please try again later.' });
 });
 
 // ---------- TikTok ----------
@@ -128,7 +92,7 @@ app.get('/api/tiktok', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ---------- Facebook (yt-dlp, no proxy) ----------
+// ---------- Facebook (same cookies) ----------
 const cache = new Map();
 app.get('/api/info', async (req, res) => {
     const { url, format } = req.query;
@@ -154,7 +118,7 @@ app.get('/api/download', async (req, res) => {
     const { url, formatId } = req.query;
     if (!url) return res.status(400).json({ error: 'URL required' });
     const key = `${url}|${formatId || 'best'}`;
-    if (cache.has(key) && Date.now() - cache.get(key).ts < 10*60*1000) {
+    if (cache.has(key) && Date.now() - cache.get(key).ts < 10 * 60 * 1000) {
         return res.json({ downloadUrl: cache.get(key).url });
     }
     try {
@@ -162,6 +126,22 @@ app.get('/api/download', async (req, res) => {
         cache.set(key, { url: directUrl, ts: Date.now() });
         res.json({ downloadUrl: directUrl });
     } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ---------- PROXY DOWNLOAD (forces file save) ----------
+app.get('/api/proxy-download', async (req, res) => {
+    const { url, title, ext } = req.query;
+    if (!url) return res.status(400).send('Missing URL');
+    try {
+        const videoResp = await fetchWithTimeout(url, {}, 20000);
+        if (!videoResp.ok) throw new Error(`CDN returned ${videoResp.status}`);
+        const fileName = (title || 'video').replace(/[^a-zA-Z0-9\s]/g, '').trim() + '.' + (ext || 'mp4');
+        res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+        res.setHeader('Content-Type', videoResp.headers.get('content-type') || 'video/mp4');
+        videoResp.body.pipe(res);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend running on port ${PORT}`));
