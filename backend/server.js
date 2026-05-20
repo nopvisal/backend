@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const { execFile } = require('child_process');
+const https = require('https');
 const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,14 +10,15 @@ app.use(cors());
 app.use(express.json());
 app.get('/', (req, res) => res.send('MediaForge backend is running'));
 
-// ---------- yt-dlp helper (for Facebook) ----------
-function ytDlp(args) {
+// ---------- yt-dlp helper ----------
+function ytDlp(args, proxy = null) {
     return new Promise((resolve, reject) => {
         const ytDlpPath = './yt-dlp';
         const fullArgs = ['--js-runtime', 'node', '--cookies', './cookies.txt'];
-        if (process.env.YTDLP_PROXY) fullArgs.push('--proxy', process.env.YTDLP_PROXY);
+        if (proxy) fullArgs.push('--proxy', proxy);
+        if (process.env.YTDLP_PROXY) fullArgs.push('--proxy', process.env.YTDLP_PROXY); // permanent proxy if set
         fullArgs.push(...args);
-        execFile(ytDlpPath, fullArgs, { maxBuffer: 20 * 1024 * 1024 }, (err, stdout, stderr) => {
+        execFile(ytDlpPath, fullArgs, { timeout: 8000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
             if (err) reject(new Error(stderr || err.message));
             else resolve(stdout.trim());
         });
@@ -39,6 +41,48 @@ function fetchWithTimeout(url, options = {}, timeout = 6000) {
     });
 }
 
+// ---------- Proxy Rotator ----------
+let proxyList = [];
+let proxyIndex = 0;
+let lastProxyFetch = 0;
+
+async function fetchProxyList() {
+    // Avoid fetching too often
+    if (Date.now() - lastProxyFetch < 10 * 60 * 1000) return;
+    lastProxyFetch = Date.now();
+    return new Promise((resolve) => {
+        const req = https.get('https://proxylist.geonode.com/api/proxy-list?limit=20&page=1&sort_by=lastChecked&sort_type=desc&protocols=http', (resp) => {
+            let data = '';
+            resp.on('data', chunk => data += chunk);
+            resp.on('end', () => {
+                try {
+                    const parsed = JSON.parse(data);
+                    if (parsed.data && parsed.data.length > 0) {
+                        proxyList = parsed.data.map(p => `http://${p.ip}:${p.port}`);
+                        proxyIndex = 0;
+                        console.log(`Loaded ${proxyList.length} fresh proxies`);
+                    }
+                } catch (e) { console.warn('Proxy parse error'); }
+                resolve();
+            });
+        });
+        req.on('error', (e) => { console.warn('Proxy list fetch error:', e.message); resolve(); });
+        req.setTimeout(5000, () => { req.destroy(); resolve(); });
+    });
+}
+
+function getNextProxy() {
+    if (proxyList.length === 0) return null;
+    const proxy = proxyList[proxyIndex % proxyList.length];
+    proxyIndex++;
+    return proxy;
+}
+
+// Pre-fetch proxies (non‑blocking)
+fetchProxyList();
+// Refresh every 10 minutes
+setInterval(fetchProxyList, 10 * 60 * 1000);
+
 // ---------- YouTube fallbacks ----------
 async function tryLucasDev(url) {
     try {
@@ -51,12 +95,7 @@ async function tryLucasDev(url) {
     } catch (e) { return null; }
 }
 
-const invidiousInstances = [
-    'https://vid.puffyan.us',
-    'https://invidious.snopyta.org',
-    'https://yewtu.be',
-    'https://invidious.fdn.fr',
-];
+const invidiousInstances = ['https://vid.puffyan.us', 'https://invidious.snopyta.org', 'https://yewtu.be'];
 
 async function tryInvidious(videoId) {
     for (const instance of invidiousInstances) {
@@ -94,8 +133,7 @@ async function tryCobalt(url) {
                 const oembed = await fetchWithTimeout(`https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`);
                 if (oembed.ok) {
                     const o = await oembed.json();
-                    title = o.title;
-                    thumbnail = o.thumbnail_url || thumbnail;
+                    title = o.title; thumbnail = o.thumbnail_url || thumbnail;
                 }
             } catch (e) {}
         }
@@ -103,24 +141,46 @@ async function tryCobalt(url) {
     } catch (e) { return null; }
 }
 
-// ---------- YouTube endpoint ----------
+// ---------- YouTube endpoint (proxy rotator first) ----------
 app.get('/api/youtube', async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).json({ error: 'URL required' });
 
+    // 1. Try yt-dlp with rotating free proxies (fast)
+    for (let attempt = 0; attempt < 4; attempt++) {
+        const proxy = getNextProxy();
+        if (!proxy) break;
+        console.log(`Trying proxy ${attempt + 1}: ${proxy}`);
+        try {
+            const json = await ytDlp(['--dump-json', '--no-playlist', url], proxy);
+            const info = JSON.parse(json);
+            const format = (info.formats || []).filter(f => f.acodec !== 'none' && f.vcodec !== 'none')
+                .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+            if (format) {
+                const directUrl = await ytDlp(['-f', format.format_id, '-g', url], proxy);
+                return res.json({ title: info.title, thumbnail: info.thumbnail, downloadUrl: directUrl });
+            }
+        } catch (e) {
+            console.warn(`Proxy ${proxy} failed: ${e.message}`);
+        }
+    }
+
+    // 2. Try LucasDev
     const lucas = await tryLucasDev(url);
     if (lucas) return res.json(lucas);
 
+    // 3. Try Invidious
     const idMatch = url.match(/(?:v=|\/)([a-zA-Z0-9_-]{11})(?:&|$|\/|\.)/) || url.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
     if (idMatch) {
         const invidious = await tryInvidious(idMatch[1]);
         if (invidious) return res.json(invidious);
     }
 
+    // 4. Cobalt
     const cobalt = await tryCobalt(url);
     if (cobalt) return res.json(cobalt);
 
-    res.status(500).json({ error: 'All YouTube extraction methods failed.' });
+    res.status(500).json({ error: 'All YouTube extraction methods failed. Please try again later.' });
 });
 
 // ---------- TikTok ----------
@@ -136,11 +196,8 @@ app.get('/api/tiktok', async (req, res) => {
         const directUrl = v.hdplay || v.play || v.wmplay;
         if (!directUrl) throw new Error('No video URL');
         res.json({
-            title: v.title || 'TikTok Video',
-            thumbnail: v.cover || '',
-            duration: v.duration || 'Unknown',
-            author: v.author?.nickname || '',
-            downloadUrl: directUrl,
+            title: v.title || 'TikTok Video', thumbnail: v.cover || '',
+            duration: v.duration || 'Unknown', author: v.author?.nickname || '', downloadUrl: directUrl,
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
