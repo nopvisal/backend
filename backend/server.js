@@ -11,17 +11,55 @@ app.use(express.json());
 app.get('/', (req, res) => res.send('MediaForge backend is running'));
 
 // ---------- yt-dlp helper ----------
+// ---------- yt-dlp helper ----------
 function ytDlp(args, proxy = null) {
     return new Promise((resolve, reject) => {
         const ytDlpPath = './yt-dlp';
-        const fullArgs = ['--js-runtime', 'node', '--cookies', './cookies.txt'];
-        if (proxy) fullArgs.push('--proxy', proxy);
-        if (process.env.YTDLP_PROXY) fullArgs.push('--proxy', process.env.YTDLP_PROXY); // permanent proxy if set
+
+        const fullArgs = [
+            '--no-warnings',
+            '--no-playlist',
+            '--socket-timeout', '15',
+            '--user-agent',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
+            '--extractor-args',
+            'youtube:player_client=android',
+        ];
+
+        // Cookies only if file exists
+        if (fs.existsSync('./cookies.txt')) {
+            fullArgs.push('--cookies', './cookies.txt');
+        }
+
+        // Optional proxy
+        if (proxy) {
+            fullArgs.push('--proxy', proxy);
+        }
+
+        // ENV proxy
+        if (process.env.YTDLP_PROXY) {
+            fullArgs.push('--proxy', process.env.YTDLP_PROXY);
+        }
+
         fullArgs.push(...args);
-        execFile(ytDlpPath, fullArgs, { timeout: 8000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
-            if (err) reject(new Error(stderr || err.message));
-            else resolve(stdout.trim());
-        });
+
+        execFile(
+            ytDlpPath,
+            fullArgs,
+            {
+                timeout: 30000,
+                maxBuffer: 15 * 1024 * 1024,
+            },
+            (err, stdout, stderr) => {
+                if (err) {
+                    return reject(
+                        new Error(stderr || err.message || 'yt-dlp failed')
+                    );
+                }
+
+                resolve(stdout.trim());
+            }
+        );
     });
 }
 
@@ -95,7 +133,11 @@ async function tryLucasDev(url) {
     } catch (e) { return null; }
 }
 
-const invidiousInstances = ['https://vid.puffyan.us', 'https://invidious.snopyta.org', 'https://yewtu.be'];
+const invidiousInstances = [
+    'https://inv.nadeko.net',
+    'https://yewtu.be',
+    'https://vid.puffyan.us'
+];
 
 async function tryInvidious(videoId) {
     for (const instance of invidiousInstances) {
@@ -144,26 +186,220 @@ async function tryCobalt(url) {
 // ---------- YouTube endpoint (proxy rotator first) ----------
 app.get('/api/youtube', async (req, res) => {
     const { url } = req.query;
-    if (!url) return res.status(400).json({ error: 'URL required' });
 
-    // 1. Try yt-dlp with rotating free proxies (fast)
-    for (let attempt = 0; attempt < 4; attempt++) {
-        const proxy = getNextProxy();
-        if (!proxy) break;
-        console.log(`Trying proxy ${attempt + 1}: ${proxy}`);
+    if (!url) {
+        return res.status(400).json({ error: 'URL required' });
+    }
+
+    try {
+
+        // =====================================================
+        // 1. DIRECT yt-dlp FIRST
+        // =====================================================
+
         try {
-            const json = await ytDlp(['--dump-json', '--no-playlist', url], proxy);
+            console.log('Trying direct yt-dlp...');
+
+            const json = await ytDlp([
+                '--dump-single-json',
+                '--no-playlist',
+                url,
+            ]);
+
             const info = JSON.parse(json);
-            const format = (info.formats || []).filter(f => f.acodec !== 'none' && f.vcodec !== 'none')
-                .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
-            if (format) {
-                const directUrl = await ytDlp(['-f', format.format_id, '-g', url], proxy);
-                return res.json({ title: info.title, thumbnail: info.thumbnail, downloadUrl: directUrl });
+
+            const formats = (info.formats || [])
+                .filter(
+                    f =>
+                        f.vcodec !== 'none' &&
+                        f.acodec !== 'none' &&
+                        f.ext === 'mp4'
+                )
+                .sort((a, b) => (b.height || 0) - (a.height || 0));
+
+            let selected = formats[0];
+
+            if (selected) {
+
+                const directUrl = await ytDlp([
+                    '-f',
+                    selected.format_id,
+                    '-g',
+                    url,
+                ]);
+
+                return res.json({
+                    title: info.title,
+                    thumbnail: info.thumbnail,
+                    duration: info.duration_string,
+                    quality: selected.height
+                        ? `${selected.height}p`
+                        : 'Unknown',
+                    downloadUrl: directUrl,
+                });
+            }
+
+        } catch (e) {
+            console.warn('Direct yt-dlp failed:', e.message);
+        }
+
+        // =====================================================
+        // 2. TRY ROTATING PROXIES
+        // =====================================================
+
+        for (let attempt = 0; attempt < 3; attempt++) {
+
+            const proxy = getNextProxy();
+
+            if (!proxy) break;
+
+            try {
+
+                console.log(`Trying proxy ${attempt + 1}: ${proxy}`);
+
+                const json = await ytDlp(
+                    ['--dump-single-json', '--no-playlist', url],
+                    proxy
+                );
+
+                const info = JSON.parse(json);
+
+                const formats = (info.formats || [])
+                    .filter(
+                        f =>
+                            f.vcodec !== 'none' &&
+                            f.acodec !== 'none' &&
+                            f.ext === 'mp4'
+                    )
+                    .sort((a, b) => (b.height || 0) - (a.height || 0));
+
+                if (formats.length > 0) {
+
+                    const directUrl = await ytDlp(
+                        ['-f', formats[0].format_id, '-g', url],
+                        proxy
+                    );
+
+                    return res.json({
+                        title: info.title,
+                        thumbnail: info.thumbnail,
+                        duration: info.duration_string,
+                        quality: formats[0].height
+                            ? `${formats[0].height}p`
+                            : 'Unknown',
+                        downloadUrl: directUrl,
+                    });
+                }
+
+            } catch (e) {
+                console.warn(`Proxy failed: ${proxy}`);
+            }
+        }
+
+        // =====================================================
+        // 3. LUCAS API
+        // =====================================================
+
+        try {
+            const lucas = await tryLucasDev(url);
+
+            if (lucas) {
+                return res.json(lucas);
             }
         } catch (e) {
-            console.warn(`Proxy ${proxy} failed: ${e.message}`);
+            console.warn('Lucas API failed');
         }
+
+        // =====================================================
+        // 4. INVIDIOUS
+        // =====================================================
+
+        try {
+
+            const idMatch =
+                url.match(
+                    /(?:v=|\/)([a-zA-Z0-9_-]{11})(?:&|$|\/|\.)/
+                ) ||
+                url.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
+
+            if (idMatch) {
+
+                const invidious = await tryInvidious(idMatch[1]);
+
+                if (invidious) {
+                    return res.json(invidious);
+                }
+            }
+
+        } catch (e) {
+            console.warn('Invidious failed');
+        }
+
+        // =====================================================
+        // 5. COBALT
+        // =====================================================
+
+        try {
+
+            const cobalt = await tryCobalt(url);
+
+            if (cobalt) {
+                return res.json(cobalt);
+            }
+
+        } catch (e) {
+            console.warn('Cobalt failed');
+        }
+
+        return res.status(500).json({
+            error: 'YouTube extraction failed on all providers',
+        });
+
+    } catch (err) {
+
+        console.error(err);
+
+        return res.status(500).json({
+            error: err.message || 'Internal server error',
+        });
     }
+});
+
+        // Cookies only if file exists
+        if (fs.existsSync('./cookies.txt')) {
+            fullArgs.push('--cookies', './cookies.txt');
+        }
+
+        // Optional proxy
+        if (proxy) {
+            fullArgs.push('--proxy', proxy);
+        }
+
+        // ENV proxy
+        if (process.env.YTDLP_PROXY) {
+            fullArgs.push('--proxy', process.env.YTDLP_PROXY);
+        }
+
+        fullArgs.push(...args);
+
+        execFile(
+            ytDlpPath,
+            fullArgs,
+            {
+                timeout: 30000,
+                maxBuffer: 15 * 1024 * 1024,
+            },
+            (err, stdout, stderr) => {
+                if (err) {
+                    return reject(
+                        new Error(stderr || err.message || 'yt-dlp failed')
+                    );
+                }
+
+                resolve(stdout.trim());
+            }
+        );
+    });
 
     // 2. Try LucasDev
     const lucas = await tryLucasDev(url);
@@ -181,7 +417,7 @@ app.get('/api/youtube', async (req, res) => {
     if (cobalt) return res.json(cobalt);
 
     res.status(500).json({ error: 'All YouTube extraction methods failed. Please try again later.' });
-});
+};
 
 // ---------- TikTok ----------
 app.get('/api/tiktok', async (req, res) => {
