@@ -10,20 +10,11 @@ app.use(express.json());
 
 app.get('/', (req, res) => res.send('MediaForge backend is running'));
 
-// Cookies file
-if (process.env.YOUTUBE_COOKIES) {
-    fs.writeFileSync('./cookies.txt', process.env.YOUTUBE_COOKIES);
-    console.log('Cookies file written');
-}
-
-// ---------- yt-dlp helper ----------
+// -------- yt-dlp helper (for Facebook only) --------
 function ytDlp(args) {
     return new Promise((resolve, reject) => {
         const ytDlpPath = './yt-dlp';
-        const fullArgs = [
-            '--js-runtime', 'node',
-            '--cookies', './cookies.txt',
-        ];
+        const fullArgs = ['--js-runtime', 'node', '--cookies', './cookies.txt'];
         if (process.env.YTDLP_PROXY) fullArgs.push('--proxy', process.env.YTDLP_PROXY);
         fullArgs.push(...args);
         execFile(ytDlpPath, fullArgs, { maxBuffer: 20*1024*1024 }, (err, stdout, stderr) => {
@@ -33,96 +24,58 @@ function ytDlp(args) {
     });
 }
 
-// ---------- Invidious fallback ----------
-const invidiousInstances = [
-    'https://vid.puffyan.us',
-    'https://invidious.snopyta.org',
-    'https://yewtu.be',
-    'https://invidious.fdn.fr',
-    'https://invidious.nerdvpn.de',
-];
+// Write cookies file if present (for Facebook)
+if (process.env.YOUTUBE_COOKIES) {
+    fs.writeFileSync('./cookies.txt', process.env.YOUTUBE_COOKIES);
+}
 
-async function tryInvidious(videoId) {
-    for (const instance of invidiousInstances) {
+// -------- Cobalt (YouTube only) --------
+async function cobaltYouTube(url) {
+    const body = {
+        url,
+        filenamePattern: 'basic',
+        isAudioOnly: false,
+        videoQuality: '720',
+    };
+    const resp = await fetch('https://api.cobalt.tools/api/json', {
+        method: 'POST',
+        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (data.status === 'error' || !data.url) throw new Error(data.error?.code || 'Cobalt error');
+
+    // Get title & thumbnail from YouTube oEmbed
+    let title = 'YouTube Video';
+    let thumbnail = '';
+    const idMatch = url.match(/(?:v=|\/)([a-zA-Z0-9_-]{11})(?:&|$|\/|\.)/) || url.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
+    if (idMatch) {
+        thumbnail = `https://img.youtube.com/vi/${idMatch[1]}/hqdefault.jpg`;
         try {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 5000);
-            const resp = await fetch(`${instance}/api/v1/videos/${videoId}`, { signal: controller.signal });
-            clearTimeout(timeout);
-            if (!resp.ok) continue;
-            const data = await resp.json();
-            const format = data.formatStreams
-                ?.filter(f => f.container === 'mp4' && f.audioChannels > 0)
-                ?.sort((a, b) => (b.width || 0) - (a.width || 0))[0];
-            if (format) return { title: data.title, thumbnail: data.videoThumbnails?.[0]?.url || '', downloadUrl: format.url };
+            const oembed = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`);
+            if (oembed.ok) {
+                const o = await oembed.json();
+                title = o.title;
+                thumbnail = o.thumbnail_url || thumbnail;
+            }
         } catch (e) {}
     }
-    return null;
+    return { title, thumbnail, downloadUrl: data.url };
 }
 
-// ---------- Cobalt fallback ----------
-async function tryCobalt(youtubeUrl) {
-    try {
-        const resp = await fetch('https://api.cobalt.tools/api/json', {
-            method: 'POST',
-            headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url: youtubeUrl, filenamePattern: 'basic' }),
-        });
-        const data = await resp.json();
-        if (data.status === 'error' || !data.url) return null;
-        // Try to get title/thumbnail via YouTube oEmbed
-        let title = 'YouTube Video';
-        let thumbnail = '';
-        const idMatch = youtubeUrl.match(/(?:v=|\/)([a-zA-Z0-9_-]{11})(?:&|$|\/|\.)/) || youtubeUrl.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
-        if (idMatch) {
-            thumbnail = `https://img.youtube.com/vi/${idMatch[1]}/hqdefault.jpg`;
-            try {
-                const oembed = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(youtubeUrl)}&format=json`);
-                if (oembed.ok) {
-                    const odata = await oembed.json();
-                    title = odata.title;
-                    thumbnail = odata.thumbnail_url || thumbnail;
-                }
-            } catch (e) {}
-        }
-        return { title, thumbnail, downloadUrl: data.url };
-    } catch (e) {
-        return null;
-    }
-}
-
-// ========== YouTube endpoint ==========
+// -------- YouTube endpoint --------
 app.get('/api/youtube', async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).json({ error: 'URL required' });
-
-    // 1. yt-dlp
     try {
-        const json = await ytDlp(['--dump-json', '--no-playlist', url]);
-        const info = JSON.parse(json);
-        const format = (info.formats || []).filter(f => f.acodec !== 'none' && f.vcodec !== 'none')
-            .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
-        if (format) {
-            const directUrl = await ytDlp(['-f', format.format_id, '-g', url]);
-            return res.json({ title: info.title, thumbnail: info.thumbnail, downloadUrl: directUrl });
-        }
-    } catch (e) { console.warn('yt-dlp failed:', e.message); }
-
-    // 2. Invidious
-    const idMatch = url.match(/(?:v=|\/)([a-zA-Z0-9_-]{11})(?:&|$|\/|\.)/) || url.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
-    if (idMatch) {
-        const invidious = await tryInvidious(idMatch[1]);
-        if (invidious) return res.json(invidious);
+        const result = await cobaltYouTube(url);
+        res.json(result);
+    } catch (err) {
+        res.status(500).json({ error: 'Cobalt failed: ' + err.message });
     }
-
-    // 3. Cobalt
-    const cobalt = await tryCobalt(url);
-    if (cobalt) return res.json(cobalt);
-
-    res.status(500).json({ error: 'All YouTube extraction methods failed. Please try again later.' });
 });
 
-// ========== TikTok (unchanged) ==========
+// -------- TikTok (unchanged) --------
 app.get('/api/tiktok', async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).json({ error: 'URL required' });
@@ -134,11 +87,17 @@ app.get('/api/tiktok', async (req, res) => {
         const v = data.data;
         const directUrl = v.hdplay || v.play || v.wmplay;
         if (!directUrl) throw new Error('No video URL');
-        res.json({ title: v.title || 'TikTok Video', thumbnail: v.cover || '', duration: v.duration || 'Unknown', author: v.author?.nickname || '', downloadUrl: directUrl });
+        res.json({
+            title: v.title || 'TikTok Video',
+            thumbnail: v.cover || '',
+            duration: v.duration || 'Unknown',
+            author: v.author?.nickname || '',
+            downloadUrl: directUrl,
+        });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ========== Facebook / general (yt-dlp) ==========
+// -------- Facebook (yt-dlp) --------
 const cache = new Map();
 app.get('/api/info', async (req, res) => {
     const { url, format } = req.query;
@@ -174,7 +133,7 @@ app.get('/api/download', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ========== Proxy download (forces file save) ==========
+// -------- Force‑download proxy --------
 app.get('/api/proxy-download', async (req, res) => {
     const { url, title, ext } = req.query;
     if (!url) return res.status(400).send('Missing URL');
@@ -188,5 +147,4 @@ app.get('/api/proxy-download', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ========== Start server ==========
 app.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend running on port ${PORT}`));
