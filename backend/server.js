@@ -1,8 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const { execFile } = require('child_process');
-const https = require('https');
-const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -10,66 +8,33 @@ app.use(cors());
 app.use(express.json());
 app.get('/', (req, res) => res.send('MediaForge backend is running'));
 
-// ---------- yt-dlp helper ----------
-// ---------- yt-dlp helper ----------
-function ytDlp(args, proxy = null) {
+// ---------- yt-dlp helper (with proxy and timeout) ----------
+function ytDlp(args) {
     return new Promise((resolve, reject) => {
         const ytDlpPath = './yt-dlp';
-
         const fullArgs = [
-            '--no-warnings',
-            '--no-playlist',
+            '--no-warnings', '--no-playlist',
             '--socket-timeout', '15',
-            '--user-agent',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-            '--extractor-args',
-            'youtube:player_client=android',
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            '--extractor-args', 'youtube:player_client=android',
         ];
 
-        // Cookies only if file exists
-        if (fs.existsSync('./cookies.txt')) {
-            fullArgs.push('--cookies', './cookies.txt');
-        }
-
-        // Optional proxy
-        if (proxy) {
-            fullArgs.push('--proxy', proxy);
-        }
-
-        // ENV proxy
+        // Residential proxy from environment variable
         if (process.env.YTDLP_PROXY) {
             fullArgs.push('--proxy', process.env.YTDLP_PROXY);
         }
 
         fullArgs.push(...args);
 
-        execFile(
-            ytDlpPath,
-            fullArgs,
-            {
-                timeout: 30000,
-                maxBuffer: 15 * 1024 * 1024,
-            },
-            (err, stdout, stderr) => {
-                if (err) {
-                    return reject(
-                        new Error(stderr || err.message || 'yt-dlp failed')
-                    );
-                }
-
-                resolve(stdout.trim());
-            }
-        );
+        execFile(ytDlpPath, fullArgs, { timeout: 15000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+            if (err) return reject(new Error(stderr || err.message));
+            resolve(stdout.trim());
+        });
     });
 }
 
-// Write cookies if present
-if (process.env.YOUTUBE_COOKIES) {
-    fs.writeFileSync('./cookies.txt', process.env.YOUTUBE_COOKIES);
-}
-
-// ---------- Fetch helper with timeout ----------
-function fetchWithTimeout(url, options = {}, timeout = 6000) {
+// ---------- Fetch with timeout ----------
+function fetchWithTimeout(url, options = {}, timeout = 8000) {
     return new Promise((resolve, reject) => {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeout);
@@ -79,49 +44,7 @@ function fetchWithTimeout(url, options = {}, timeout = 6000) {
     });
 }
 
-// ---------- Proxy Rotator ----------
-let proxyList = [];
-let proxyIndex = 0;
-let lastProxyFetch = 0;
-
-async function fetchProxyList() {
-    // Avoid fetching too often
-    if (Date.now() - lastProxyFetch < 10 * 60 * 1000) return;
-    lastProxyFetch = Date.now();
-    return new Promise((resolve) => {
-        const req = https.get('https://proxylist.geonode.com/api/proxy-list?limit=20&page=1&sort_by=lastChecked&sort_type=desc&protocols=http', (resp) => {
-            let data = '';
-            resp.on('data', chunk => data += chunk);
-            resp.on('end', () => {
-                try {
-                    const parsed = JSON.parse(data);
-                    if (parsed.data && parsed.data.length > 0) {
-                        proxyList = parsed.data.map(p => `http://${p.ip}:${p.port}`);
-                        proxyIndex = 0;
-                        console.log(`Loaded ${proxyList.length} fresh proxies`);
-                    }
-                } catch (e) { console.warn('Proxy parse error'); }
-                resolve();
-            });
-        });
-        req.on('error', (e) => { console.warn('Proxy list fetch error:', e.message); resolve(); });
-        req.setTimeout(5000, () => { req.destroy(); resolve(); });
-    });
-}
-
-function getNextProxy() {
-    if (proxyList.length === 0) return null;
-    const proxy = proxyList[proxyIndex % proxyList.length];
-    proxyIndex++;
-    return proxy;
-}
-
-// Pre-fetch proxies (non‑blocking)
-fetchProxyList();
-// Refresh every 10 minutes
-setInterval(fetchProxyList, 10 * 60 * 1000);
-
-// ---------- YouTube fallbacks ----------
+// ---------- YouTube fallback APIs ----------
 async function tryLucasDev(url) {
     try {
         const apiUrl = `https://api.lucash.dev/video?url=${encodeURIComponent(url)}`;
@@ -133,10 +56,9 @@ async function tryLucasDev(url) {
     } catch (e) { return null; }
 }
 
-const invidiousInstances = ['https://vid.puffyan.us', 'https://invidious.snopyta.org', 'https://yewtu.be'];
-
 async function tryInvidious(videoId) {
-    for (const instance of invidiousInstances) {
+    const instances = ['https://inv.nadeko.net', 'https://yewtu.be', 'https://vid.puffyan.us'];
+    for (const instance of instances) {
         try {
             const url = `${instance}/api/v1/videos/${videoId}`;
             const resp = await fetchWithTimeout(url);
@@ -148,7 +70,7 @@ async function tryInvidious(videoId) {
             if (format) {
                 return { title: data.title, thumbnail: data.videoThumbnails?.[0]?.url || '', downloadUrl: format.url };
             }
-        } catch (e) { /* next */ }
+        } catch (e) { /* next instance */ }
     }
     return null;
 }
@@ -179,35 +101,38 @@ async function tryCobalt(url) {
     } catch (e) { return null; }
 }
 
-// ---------- YouTube endpoint (proxy rotator first) ----------
+// ---------- YouTube endpoint ----------
 app.get('/api/youtube', async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).json({ error: 'URL required' });
 
-    // 1. Try yt-dlp with rotating free proxies (fast)
-    for (let attempt = 0; attempt < 4; attempt++) {
-        const proxy = getNextProxy();
-        if (!proxy) break;
-        console.log(`Trying proxy ${attempt + 1}: ${proxy}`);
-        try {
-            const json = await ytDlp(['--dump-json', '--no-playlist', url], proxy);
-            const info = JSON.parse(json);
-            const format = (info.formats || []).filter(f => f.acodec !== 'none' && f.vcodec !== 'none')
-                .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
-            if (format) {
-                const directUrl = await ytDlp(['-f', format.format_id, '-g', url], proxy);
-                return res.json({ title: info.title, thumbnail: info.thumbnail, downloadUrl: directUrl });
-            }
-        } catch (e) {
-            console.warn(`Proxy ${proxy} failed: ${e.message}`);
+    // 1. yt-dlp with residential proxy (fast timeout)
+    try {
+        console.log('Trying yt-dlp with proxy...');
+        const json = await ytDlp(['--dump-single-json', url]);
+        const info = JSON.parse(json);
+        const formats = (info.formats || [])
+            .filter(f => f.vcodec !== 'none' && f.acodec !== 'none' && f.ext === 'mp4')
+            .sort((a, b) => (b.height || 0) - (a.height || 0));
+        if (formats.length > 0) {
+            const directUrl = await ytDlp(['-f', formats[0].format_id, '-g', url]);
+            return res.json({
+                title: info.title,
+                thumbnail: info.thumbnail,
+                duration: info.duration_string,
+                quality: formats[0].height ? `${formats[0].height}p` : 'Unknown',
+                downloadUrl: directUrl,
+            });
         }
+    } catch (ytErr) {
+        console.warn('yt-dlp failed:', ytErr.message);
     }
 
-    // 2. Try LucasDev
+    // 2. LucasDev
     const lucas = await tryLucasDev(url);
     if (lucas) return res.json(lucas);
 
-    // 3. Try Invidious
+    // 3. Invidious
     const idMatch = url.match(/(?:v=|\/)([a-zA-Z0-9_-]{11})(?:&|$|\/|\.)/) || url.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
     if (idMatch) {
         const invidious = await tryInvidious(idMatch[1]);
@@ -234,19 +159,22 @@ app.get('/api/tiktok', async (req, res) => {
         const directUrl = v.hdplay || v.play || v.wmplay;
         if (!directUrl) throw new Error('No video URL');
         res.json({
-            title: v.title || 'TikTok Video', thumbnail: v.cover || '',
-            duration: v.duration || 'Unknown', author: v.author?.nickname || '', downloadUrl: directUrl,
+            title: v.title || 'TikTok Video',
+            thumbnail: v.cover || '',
+            duration: v.duration || 'Unknown',
+            author: v.author?.nickname || '',
+            downloadUrl: directUrl,
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ---------- Facebook / general (yt-dlp) ----------
+// ---------- Facebook (yt-dlp with same proxy) ----------
 const cache = new Map();
 app.get('/api/info', async (req, res) => {
     const { url, format } = req.query;
     if (!url) return res.status(400).json({ error: 'URL required' });
     try {
-        const json = await ytDlp(['--dump-json', '--no-playlist', url]);
+        const json = await ytDlp(['--dump-single-json', url]);
         const info = JSON.parse(json);
         let formatId = 'best';
         if (format === 'mp3') {
@@ -265,12 +193,12 @@ app.get('/api/info', async (req, res) => {
 app.get('/api/download', async (req, res) => {
     const { url, formatId } = req.query;
     if (!url) return res.status(400).json({ error: 'URL required' });
-    const key = `${url}|${formatId||'best'}`;
+    const key = `${url}|${formatId || 'best'}`;
     if (cache.has(key) && Date.now() - cache.get(key).ts < 10*60*1000) {
         return res.json({ downloadUrl: cache.get(key).url });
     }
     try {
-        const directUrl = await ytDlp(['-f', formatId || 'best', '-g', '--no-playlist', url]);
+        const directUrl = await ytDlp(['-f', formatId || 'best', '-g', url]);
         cache.set(key, { url: directUrl, ts: Date.now() });
         res.json({ downloadUrl: directUrl });
     } catch (err) { res.status(500).json({ error: err.message }); }
