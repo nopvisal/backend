@@ -11,23 +11,28 @@ app.use(express.json());
 // Health check
 app.get('/', (req, res) => res.send('MediaForge backend is running'));
 
-// Write cookies from environment variable (only once at startup)
+// Write cookies if provided
 if (process.env.YOUTUBE_COOKIES) {
     fs.writeFileSync('./cookies.txt', process.env.YOUTUBE_COOKIES);
     console.log('Cookies file written');
 } else {
-    console.warn('No YOUTUBE_COOKIES environment variable set – YouTube may fail');
+    console.warn('No YOUTUBE_COOKIES – YouTube might need a proxy');
 }
 
-// yt-dlp helper – always uses the cookie file
+// ========== yt-dlp helper (with optional proxy) ==========
 function ytDlp(args) {
     return new Promise((resolve, reject) => {
         const ytDlpPath = './yt-dlp';
         const fullArgs = [
             '--js-runtime', 'node',
             '--cookies', './cookies.txt',
-            ...args
         ];
+        // Add proxy if environment variable is set
+        if (process.env.YTDLP_PROXY) {
+            fullArgs.push('--proxy', process.env.YTDLP_PROXY);
+        }
+        fullArgs.push(...args);
+
         execFile(ytDlpPath, fullArgs, { maxBuffer: 20 * 1024 * 1024 }, (error, stdout, stderr) => {
             if (error) reject(new Error(stderr || error.message));
             else resolve(stdout.trim());
@@ -35,106 +40,130 @@ function ytDlp(args) {
     });
 }
 
-// Cache for download URLs
-const cache = new Map();
+// ========== Invidious fallback (more robust) ==========
+const invidiousInstances = [
+    'https://vid.puffyan.us',
+    'https://invidious.snopyta.org',
+    'https://yewtu.be',
+    'https://invidious.fdn.fr',
+    'https://invidious.nerdvpn.de',
+    'https://invidious.weblibre.org',
+];
 
-// Video info (YouTube + Facebook)
-app.get('/api/info', async (req, res) => {
-    const { url, format } = req.query;
+async function tryInvidious(videoId) {
+    for (const instance of invidiousInstances) {
+        try {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 5000);
+            const resp = await fetch(`${instance}/api/v1/videos/${videoId}`, { signal: controller.signal });
+            clearTimeout(timeout);
+            if (!resp.ok) continue;
+            const data = await resp.json();
+            const format = data.formatStreams
+                ?.filter(f => f.container === 'mp4' && f.audioChannels > 0)
+                ?.sort((a, b) => (b.width || 0) - (a.width || 0))[0];
+            if (!format) continue;
+            return {
+                title: data.title,
+                thumbnail: data.videoThumbnails?.[0]?.url || '',
+                downloadUrl: format.url,
+            };
+        } catch (e) { /* instance failed, try next */ }
+    }
+    return null;
+}
+
+// ========== Free rotating proxy list (for yt-dlp) ==========
+let proxyList = [];
+let proxyIndex = 0;
+async function refreshProxyList() {
+    try {
+        // Fetch free residential proxies (these are HTTP, not all work, but we cycle)
+        const resp = await fetch('https://proxylist.geonode.com/api/proxy-list?limit=20&page=1&sort_by=lastChecked&sort_type=desc&protocols=http');
+        const data = await resp.json();
+        proxyList = data.data.map(p => `http://${p.ip}:${p.port}`);
+        console.log(`Loaded ${proxyList.length} proxies`);
+    } catch (e) {
+        console.warn('Failed to refresh proxy list:', e.message);
+    }
+}
+refreshProxyList();
+setInterval(refreshProxyList, 15 * 60 * 1000); // refresh every 15 min
+
+function getNextProxy() {
+    if (proxyList.length === 0) return null;
+    const proxy = proxyList[proxyIndex % proxyList.length];
+    proxyIndex++;
+    return proxy;
+}
+
+// ========== YouTube video info with fallback ==========
+app.get('/api/youtube', async (req, res) => {
+    const { url } = req.query;
     if (!url) return res.status(400).json({ error: 'URL required' });
+    const idMatch = url.match(/(?:v=|\/)([a-zA-Z0-9_-]{11})(?:&|$|\/|\.)/) || url.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
+    if (!idMatch) return res.status(400).json({ error: 'Invalid YouTube URL' });
+    const videoId = idMatch[1];
+
+    // 1. Try yt-dlp first (with cookies + optional proxy)
     try {
         const json = await ytDlp(['--dump-json', '--no-playlist', url]);
         const info = JSON.parse(json);
-        const thumbnail = info.thumbnail || info.thumbnails?.[0]?.url || '';
-        let formatId = 'best';
-        if (format === 'mp3') {
-            const bestAudio = (info.formats || [])
-                .filter(f => f.acodec !== 'none' && f.vcodec === 'none')
-                .sort((a, b) => (b.abr || 0) - (a.abr || 0))[0];
-            if (bestAudio) formatId = bestAudio.format_id;
-        } else {
-            const combined = (info.formats || [])
-                .filter(f => f.vcodec !== 'none' && f.acodec !== 'none')
-                .sort((a, b) => (b.height || 0) - (a.height || 0));
-            if (combined.length) formatId = combined[0].format_id;
-            else {
-                const bestVideo = (info.formats || [])
-                    .filter(f => f.vcodec !== 'none' && f.acodec === 'none')
-                    .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
-                const bestAudio = (info.formats || [])
-                    .filter(f => f.acodec !== 'none' && f.vcodec === 'none')
-                    .sort((a, b) => (b.abr || 0) - (a.abr || 0))[0];
-                if (bestVideo && bestAudio) formatId = `${bestVideo.format_id}+${bestAudio.format_id}`;
-            }
-        }
-        res.json({ title: info.title, thumbnail, duration: info.duration_string || `${Math.floor(info.duration||0)}s`, formatId });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// Download URL
-app.get('/api/download', async (req, res) => {
-    const { url, formatId } = req.query;
-    if (!url) return res.status(400).json({ error: 'URL required' });
-    const key = `${url}|${formatId || 'best'}`;
-    if (cache.has(key) && Date.now() - cache.get(key).ts < 10 * 60 * 1000) {
-        return res.json({ downloadUrl: cache.get(key).url });
-    }
-    try {
-        const directUrl = await ytDlp(['-f', formatId || 'best', '-g', '--no-playlist', url]);
-        cache.set(key, { url: directUrl, ts: Date.now() });
-        res.json({ downloadUrl: directUrl });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// TikTok endpoint
-app.get('/api/tiktok', async (req, res) => {
-    const { url } = req.query;
-    if (!url) return res.status(400).json({ error: 'URL required' });
-    try {
-        const apiUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`;
-        const response = await fetch(apiUrl);
-        const data = await response.json();
-        if (data.code !== 0 || !data.data) throw new Error(data.msg || 'TikTok API error');
-        const v = data.data;
-        const directUrl = v.hdplay || v.play || v.wmplay;
-        if (!directUrl) throw new Error('No video URL');
+        const format = (info.formats || [])
+            .filter(f => f.acodec !== 'none' && f.vcodec !== 'none')
+            .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+        if (!format) throw new Error('No combined format');
+        const directUrl = await ytDlp(['-f', format.format_id, '-g', url]);
         res.json({
-            title: v.title || 'TikTok Video',
-            thumbnail: v.cover || '',
-            duration: v.duration || 'Unknown',
-            author: v.author?.nickname || '',
+            title: info.title,
+            thumbnail: info.thumbnail,
             downloadUrl: directUrl,
         });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
+        return;
+    } catch (ytErr) {
+        console.warn('yt-dlp failed:', ytErr.message);
+        // try yt-dlp with a free proxy (no cookies needed sometimes)
+        try {
+            const proxy = getNextProxy();
+            if (proxy) {
+                const proxyArgs = ['--proxy', proxy, '--dump-json', '--no-playlist', url];
+                const ytDlpPath = './yt-dlp';
+                const json = await new Promise((resolve, reject) => {
+                    execFile(ytDlpPath, proxyArgs, { maxBuffer: 20*1024*1024 }, (err, stdout, stderr) => {
+                        if (err) reject(new Error(stderr));
+                        else resolve(stdout.trim());
+                    });
+                });
+                const info = JSON.parse(json);
+                const format = (info.formats || [])
+                    .filter(f => f.acodec !== 'none' && f.vcodec !== 'none')
+                    .sort((a,b) => (b.height||0)-(a.height||0))[0];
+                if (!format) throw new Error('No combined format');
+                const directUrl = await new Promise((resolve, reject) => {
+                    execFile(ytDlpPath, ['--proxy', proxy, '-f', format.format_id, '-g', url], { maxBuffer: 20*1024*1024 }, (err, stdout) => {
+                        if (err) reject(new Error(stderr));
+                        else resolve(stdout.trim());
+                    });
+                });
+                res.json({ title: info.title, thumbnail: info.thumbnail, downloadUrl: directUrl });
+                return;
+            }
+        } catch (proxyErr) {
+            console.warn('yt-dlp with proxy failed:', proxyErr.message);
+        }
     }
-});
-// Proxy download – backend fetches the video and forces a file download
-app.get('/api/proxy-download', async (req, res) => {
-    const { url, title, ext } = req.query;
-    if (!url) return res.status(400).send('Missing URL');
 
-    try {
-        // Fetch the video from the CDN (server-to-server, no CORS issues)
-        const videoResponse = await fetch(url);
-        if (!videoResponse.ok) throw new Error(`CDN returned ${videoResponse.status}`);
-
-        // Set headers to force download
-        const fileName = (title || 'video').replace(/[^a-zA-Z0-9\s]/g, '').trim() + '.' + (ext || 'mp4');
-        res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-        res.setHeader('Content-Type', videoResponse.headers.get('content-type') || 'video/mp4');
-
-        // Pipe the video data to the client
-        videoResponse.body.pipe(res);
-    } catch (err) {
-        console.error('Proxy download error:', err);
-        res.status(500).json({ error: err.message });
+    // 2. Fallback to Invidious
+    const invidiousResult = await tryInvidious(videoId);
+    if (invidiousResult) {
+        res.json(invidiousResult);
+        return;
     }
+
+    // 3. All failed
+    res.status(500).json({ error: 'All YouTube extraction methods failed. Please try again later.' });
 });
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ Backend running on port ${PORT}`);
-});
+
+// ========== Other endpoints (Facebook, TikTok, proxy download) ==========
+// Keep your existing /api/info, /api/download, /api/tiktok, /api/proxy-download here
+// (unchanged from your current working version)
