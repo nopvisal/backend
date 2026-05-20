@@ -15,7 +15,7 @@ if (process.env.YOUTUBE_COOKIES) {
     console.log('Cookies file written');
 }
 
-// ---------- yt-dlp helper (execFile, with timeout) ----------
+// yt-dlp helper
 function ytDlp(args) {
     return new Promise((resolve, reject) => {
         const ytDlpPath = './yt-dlp';
@@ -42,7 +42,7 @@ function ytDlp(args) {
     });
 }
 
-// ---------- YouTube info + direct URL ----------
+// YouTube – returns info + direct download URL
 app.get('/api/youtube', async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).json({ error: 'URL required' });
@@ -64,7 +64,7 @@ app.get('/api/youtube', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ---------- TikTok info ----------
+// TikTok – returns info + direct download URL
 app.get('/api/tiktok', async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).json({ error: 'URL required' });
@@ -84,7 +84,7 @@ app.get('/api/tiktok', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ---------- Facebook info + direct URL ----------
+// Facebook – returns info + direct download URL
 const cache = new Map();
 app.get('/api/info', async (req, res) => {
     const { url, format } = req.query;
@@ -103,11 +103,8 @@ app.get('/api/info', async (req, res) => {
             if (combined.length) formatId = combined[0].format_id;
         }
         const directUrl = await ytDlp(['-f', formatId, '-g', url]);
-        cache.set(url + format, { url: directUrl, ts: Date.now() });
         res.json({ title: info.title, thumbnail: info.thumbnail, duration: info.duration_string, downloadUrl: directUrl });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
-
-// (Keep /api/download if needed, but we'll use direct URL from info endpoint above)
 
 app.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend running on port ${PORT}`));
