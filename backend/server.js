@@ -16,10 +16,10 @@ if (process.env.YOUTUBE_COOKIES) {
     fs.writeFileSync('./cookies.txt', process.env.YOUTUBE_COOKIES);
     console.log('Cookies file written');
 } else {
-    console.warn('No YOUTUBE_COOKIES – YouTube may need a proxy');
+    console.warn('No YOUTUBE_COOKIES – YouTube may need a proxy or will use Invidious fallback');
 }
 
-// ========== yt-dlp helper ==========
+// ========== yt-dlp helper (with optional proxy) ==========
 function ytDlp(args) {
     return new Promise((resolve, reject) => {
         const ytDlpPath = './yt-dlp';
@@ -27,6 +27,7 @@ function ytDlp(args) {
             '--js-runtime', 'node',
             '--cookies', './cookies.txt',
         ];
+        // If you later add a PAID residential proxy, set YTDLP_PROXY env variable
         if (process.env.YTDLP_PROXY) {
             fullArgs.push('--proxy', process.env.YTDLP_PROXY);
         }
@@ -70,29 +71,7 @@ async function tryInvidious(videoId) {
     return null;
 }
 
-// ========== Free proxy list (refreshed after server starts) ==========
-let proxyList = [];
-let proxyIndex = 0;
-
-async function refreshProxyList() {
-    try {
-        const resp = await fetch('https://proxylist.geonode.com/api/proxy-list?limit=20&page=1&sort_by=lastChecked&sort_type=desc&protocols=http', { timeout: 8000 });
-        const data = await resp.json();
-        proxyList = data.data.map(p => `http://${p.ip}:${p.port}`);
-        console.log(`Loaded ${proxyList.length} free proxies`);
-    } catch (e) {
-        console.warn('Failed to refresh proxy list:', e.message);
-    }
-}
-
-function getNextProxy() {
-    if (proxyList.length === 0) return null;
-    const proxy = proxyList[proxyIndex % proxyList.length];
-    proxyIndex++;
-    return proxy;
-}
-
-// ========== YouTube endpoint (with multi-fallback) ==========
+// ========== YouTube endpoint (cookies -> Invidious) ==========
 app.get('/api/youtube', async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).json({ error: 'URL required' });
@@ -100,7 +79,7 @@ app.get('/api/youtube', async (req, res) => {
     if (!idMatch) return res.status(400).json({ error: 'Invalid YouTube URL' });
     const videoId = idMatch[1];
 
-    // 1. yt-dlp with cookies (if available) and optional proxy
+    // 1. Try yt-dlp with cookies (and optional paid proxy)
     try {
         const json = await ytDlp(['--dump-json', '--no-playlist', url]);
         const info = JSON.parse(json);
@@ -114,38 +93,13 @@ app.get('/api/youtube', async (req, res) => {
         console.warn('yt-dlp failed:', ytErr.message);
     }
 
-    // 2. Try with free proxy (no cookies)
-    try {
-        const proxy = getNextProxy();
-        if (proxy) {
-            console.log('Trying free proxy:', proxy);
-            const ytDlpPath = './yt-dlp';
-            const getJson = (args) => new Promise((resolve, reject) => {
-                execFile(ytDlpPath, args, { maxBuffer: 20*1024*1024 }, (err, stdout, stderr) => {
-                    if (err) reject(new Error(stderr));
-                    else resolve(stdout.trim());
-                });
-            });
-            const json = await getJson(['--proxy', proxy, '--dump-json', '--no-playlist', url]);
-            const info = JSON.parse(json);
-            const format = (info.formats || [])
-                .filter(f => f.acodec !== 'none' && f.vcodec !== 'none')
-                .sort((a,b) => (b.height||0)-(a.height||0))[0];
-            if (!format) throw new Error('No format');
-            const directUrl = await getJson(['--proxy', proxy, '-f', format.format_id, '-g', url]);
-            return res.json({ title: info.title, thumbnail: info.thumbnail, downloadUrl: directUrl });
-        }
-    } catch (proxyErr) {
-        console.warn('yt-dlp with proxy failed:', proxyErr.message);
-    }
-
-    // 3. Invidious fallback
+    // 2. Fallback to Invidious
     const invidiousResult = await tryInvidious(videoId);
     if (invidiousResult) {
         return res.json(invidiousResult);
     }
 
-    // All failed
+    // 3. All failed
     res.status(500).json({ error: 'All YouTube extraction methods failed. Please try again later.' });
 });
 
@@ -235,7 +189,4 @@ app.get('/api/proxy-download', async (req, res) => {
 // ========== Start server ==========
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Backend running on port ${PORT}`);
-    // Refresh proxy list in background (do not block startup)
-    refreshProxyList();
-    setInterval(refreshProxyList, 15 * 60 * 1000);
 });
