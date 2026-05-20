@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const { execFile } = require('child_process');
-const https = require('https');
 const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -24,13 +23,13 @@ function ytDlp(args) {
     });
 }
 
-// Write cookies file if present
+// Write cookies if present
 if (process.env.YOUTUBE_COOKIES) {
     fs.writeFileSync('./cookies.txt', process.env.YOUTUBE_COOKIES);
 }
 
-// ---------- Fetch with timeout ----------
-function fetchWithTimeout(url, options = {}, timeout = 5000) {
+// ---------- Fetch helper with timeout ----------
+function fetchWithTimeout(url, options = {}, timeout = 6000) {
     return new Promise((resolve, reject) => {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeout);
@@ -41,7 +40,6 @@ function fetchWithTimeout(url, options = {}, timeout = 5000) {
 }
 
 // ---------- YouTube fallbacks ----------
-// 1. api.lucash.dev
 async function tryLucasDev(url) {
     try {
         const apiUrl = `https://api.lucash.dev/video?url=${encodeURIComponent(url)}`;
@@ -49,21 +47,15 @@ async function tryLucasDev(url) {
         if (!resp.ok) return null;
         const data = await resp.json();
         if (data.error || !data.download_url) return null;
-        return {
-            title: data.title || 'YouTube Video',
-            thumbnail: data.thumbnail || '',
-            downloadUrl: data.download_url,
-        };
+        return { title: data.title || 'YouTube Video', thumbnail: data.thumbnail || '', downloadUrl: data.download_url };
     } catch (e) { return null; }
 }
 
-// 2. Invidious instances
 const invidiousInstances = [
     'https://vid.puffyan.us',
     'https://invidious.snopyta.org',
     'https://yewtu.be',
     'https://invidious.fdn.fr',
-    'https://invidious.nerdvpn.de',
 ];
 
 async function tryInvidious(videoId) {
@@ -77,18 +69,13 @@ async function tryInvidious(videoId) {
                 ?.filter(f => f.container === 'mp4' && f.audioChannels > 0)
                 ?.sort((a, b) => (b.width || 0) - (a.width || 0))[0];
             if (format) {
-                return {
-                    title: data.title,
-                    thumbnail: data.videoThumbnails?.[0]?.url || '',
-                    downloadUrl: format.url,
-                };
+                return { title: data.title, thumbnail: data.videoThumbnails?.[0]?.url || '', downloadUrl: format.url };
             }
-        } catch (e) { /* next instance */ }
+        } catch (e) { /* next */ }
     }
     return null;
 }
 
-// 3. Cobalt
 async function tryCobalt(url) {
     try {
         const body = JSON.stringify({ url, filenamePattern: 'basic', videoQuality: '720' });
@@ -121,25 +108,22 @@ app.get('/api/youtube', async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).json({ error: 'URL required' });
 
-    // 1. LucasDev
     const lucas = await tryLucasDev(url);
     if (lucas) return res.json(lucas);
 
-    // 2. Invidious
     const idMatch = url.match(/(?:v=|\/)([a-zA-Z0-9_-]{11})(?:&|$|\/|\.)/) || url.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
     if (idMatch) {
         const invidious = await tryInvidious(idMatch[1]);
         if (invidious) return res.json(invidious);
     }
 
-    // 3. Cobalt
     const cobalt = await tryCobalt(url);
     if (cobalt) return res.json(cobalt);
 
-    res.status(500).json({ error: 'All YouTube extraction methods failed. Please try again later.' });
+    res.status(500).json({ error: 'All YouTube extraction methods failed.' });
 });
 
-// ---------- TikTok (unchanged) ----------
+// ---------- TikTok ----------
 app.get('/api/tiktok', async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).json({ error: 'URL required' });
@@ -161,7 +145,7 @@ app.get('/api/tiktok', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ---------- Facebook / general (yt-dlp restored) ----------
+// ---------- Facebook / general (yt-dlp) ----------
 const cache = new Map();
 app.get('/api/info', async (req, res) => {
     const { url, format } = req.query;
@@ -194,20 +178,6 @@ app.get('/api/download', async (req, res) => {
         const directUrl = await ytDlp(['-f', formatId || 'best', '-g', '--no-playlist', url]);
         cache.set(key, { url: directUrl, ts: Date.now() });
         res.json({ downloadUrl: directUrl });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// ---------- Proxy download (forces file save) ----------
-app.get('/api/proxy-download', async (req, res) => {
-    const { url, title, ext } = req.query;
-    if (!url) return res.status(400).send('Missing URL');
-    try {
-        const videoResp = await fetchWithTimeout(url, {}, 15000);
-        if (!videoResp.ok) throw new Error(`CDN returned ${videoResp.status}`);
-        const fileName = (title || 'video').replace(/[^a-zA-Z0-9\s]/g, '').trim() + '.' + (ext || 'mp4');
-        res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-        res.setHeader('Content-Type', videoResp.headers.get('content-type') || 'video/mp4');
-        videoResp.body.pipe(res);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
