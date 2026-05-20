@@ -113,7 +113,28 @@ app.get('/api/tiktok', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+// Proxy download – backend fetches the video and forces a file download
+app.get('/api/proxy-download', async (req, res) => {
+    const { url, title, ext } = req.query;
+    if (!url) return res.status(400).send('Missing URL');
 
+    try {
+        // Fetch the video from the CDN (server-to-server, no CORS issues)
+        const videoResponse = await fetch(url);
+        if (!videoResponse.ok) throw new Error(`CDN returned ${videoResponse.status}`);
+
+        // Set headers to force download
+        const fileName = (title || 'video').replace(/[^a-zA-Z0-9\s]/g, '').trim() + '.' + (ext || 'mp4');
+        res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+        res.setHeader('Content-Type', videoResponse.headers.get('content-type') || 'video/mp4');
+
+        // Pipe the video data to the client
+        videoResponse.body.pipe(res);
+    } catch (err) {
+        console.error('Proxy download error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Backend running on port ${PORT}`);
 });
