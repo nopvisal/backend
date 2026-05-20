@@ -10,50 +10,12 @@ app.use(cors());
 app.use(express.json());
 app.get('/', (req, res) => res.send('MediaForge backend is running'));
 
-// ---------- Proxy rotator ----------
-let proxyList = [];
-let proxyIndex = 0;
-
-async function fetchProxyList() {
-    return new Promise((resolve) => {
-        const url = 'https://proxylist.geonode.com/api/proxy-list?limit=20&page=1&sort_by=lastChecked&sort_type=desc&protocols=http';
-        https.get(url, (resp) => {
-            let data = '';
-            resp.on('data', chunk => data += chunk);
-            resp.on('end', () => {
-                try {
-                    const parsed = JSON.parse(data);
-                    proxyList = parsed.data.map(p => `http://${p.ip}:${p.port}`);
-                    console.log(`Fetched ${proxyList.length} proxies`);
-                } catch (e) {
-                    console.warn('Failed to parse proxy list');
-                }
-                resolve();
-            });
-        }).on('error', (e) => {
-            console.warn('Proxy list fetch error:', e.message);
-            resolve();
-        });
-    });
-}
-
-function getNextProxy() {
-    if (proxyList.length === 0) return null;
-    const proxy = proxyList[proxyIndex % proxyList.length];
-    proxyIndex++;
-    return proxy;
-}
-
-// Fetch proxies immediately (non‑blocking) and then every 30 minutes
-fetchProxyList();
-setInterval(fetchProxyList, 30 * 60 * 1000);
-
-// ---------- yt-dlp helper (with fallback proxies) ----------
-function ytDlp(args, proxy = null) {
+// ---------- yt-dlp helper (for Facebook) ----------
+function ytDlp(args) {
     return new Promise((resolve, reject) => {
         const ytDlpPath = './yt-dlp';
-        const fullArgs = ['--js-runtime', 'node'];
-        if (proxy) fullArgs.push('--proxy', proxy);
+        const fullArgs = ['--js-runtime', 'node', '--cookies', './cookies.txt'];
+        if (process.env.YTDLP_PROXY) fullArgs.push('--proxy', process.env.YTDLP_PROXY);
         fullArgs.push(...args);
         execFile(ytDlpPath, fullArgs, { maxBuffer: 20 * 1024 * 1024 }, (err, stdout, stderr) => {
             if (err) reject(new Error(stderr || err.message));
@@ -62,71 +24,119 @@ function ytDlp(args, proxy = null) {
     });
 }
 
-// Write cookies if provided (for extra safety)
+// Write cookies file if present
 if (process.env.YOUTUBE_COOKIES) {
     fs.writeFileSync('./cookies.txt', process.env.YOUTUBE_COOKIES);
 }
 
-// ---------- Cobalt fallback ----------
+// ---------- Fetch with timeout ----------
+function fetchWithTimeout(url, options = {}, timeout = 5000) {
+    return new Promise((resolve, reject) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeout);
+        fetch(url, { ...options, signal: controller.signal })
+            .then(res => { clearTimeout(timer); resolve(res); })
+            .catch(err => { clearTimeout(timer); reject(err); });
+    });
+}
+
+// ---------- YouTube fallbacks ----------
+// 1. api.lucash.dev
+async function tryLucasDev(url) {
+    try {
+        const apiUrl = `https://api.lucash.dev/video?url=${encodeURIComponent(url)}`;
+        const resp = await fetchWithTimeout(apiUrl);
+        if (!resp.ok) return null;
+        const data = await resp.json();
+        if (data.error || !data.download_url) return null;
+        return {
+            title: data.title || 'YouTube Video',
+            thumbnail: data.thumbnail || '',
+            downloadUrl: data.download_url,
+        };
+    } catch (e) { return null; }
+}
+
+// 2. Invidious instances
+const invidiousInstances = [
+    'https://vid.puffyan.us',
+    'https://invidious.snopyta.org',
+    'https://yewtu.be',
+    'https://invidious.fdn.fr',
+    'https://invidious.nerdvpn.de',
+];
+
+async function tryInvidious(videoId) {
+    for (const instance of invidiousInstances) {
+        try {
+            const url = `${instance}/api/v1/videos/${videoId}`;
+            const resp = await fetchWithTimeout(url);
+            if (!resp.ok) continue;
+            const data = await resp.json();
+            const format = data.formatStreams
+                ?.filter(f => f.container === 'mp4' && f.audioChannels > 0)
+                ?.sort((a, b) => (b.width || 0) - (a.width || 0))[0];
+            if (format) {
+                return {
+                    title: data.title,
+                    thumbnail: data.videoThumbnails?.[0]?.url || '',
+                    downloadUrl: format.url,
+                };
+            }
+        } catch (e) { /* next instance */ }
+    }
+    return null;
+}
+
+// 3. Cobalt
 async function tryCobalt(url) {
     try {
         const body = JSON.stringify({ url, filenamePattern: 'basic', videoQuality: '720' });
-        const resp = await fetch('https://api.cobalt.tools/api/json', {
+        const resp = await fetchWithTimeout('https://api.cobalt.tools/api/json', {
             method: 'POST',
             headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
             body,
         });
         const data = await resp.json();
-        if (data.url) {
-            let title = 'YouTube Video', thumbnail = '';
-            const idMatch = url.match(/(?:v=|\/)([a-zA-Z0-9_-]{11})(?:&|$|\/|\.)/) || url.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
-            if (idMatch) {
-                thumbnail = `https://img.youtube.com/vi/${idMatch[1]}/hqdefault.jpg`;
-                try {
-                    const oembed = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`);
-                    if (oembed.ok) {
-                        const o = await oembed.json();
-                        title = o.title;
-                        thumbnail = o.thumbnail_url || thumbnail;
-                    }
-                } catch (e) {}
-            }
-            return { title, thumbnail, downloadUrl: data.url };
+        if (!data.url) return null;
+        let title = 'YouTube Video', thumbnail = '';
+        const idMatch = url.match(/(?:v=|\/)([a-zA-Z0-9_-]{11})(?:&|$|\/|\.)/) || url.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
+        if (idMatch) {
+            thumbnail = `https://img.youtube.com/vi/${idMatch[1]}/hqdefault.jpg`;
+            try {
+                const oembed = await fetchWithTimeout(`https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`);
+                if (oembed.ok) {
+                    const o = await oembed.json();
+                    title = o.title;
+                    thumbnail = o.thumbnail_url || thumbnail;
+                }
+            } catch (e) {}
         }
-    } catch (e) { /* fall through */ }
-    return null;
+        return { title, thumbnail, downloadUrl: data.url };
+    } catch (e) { return null; }
 }
 
-// ---------- YouTube endpoint (proxy rotator) ----------
+// ---------- YouTube endpoint ----------
 app.get('/api/youtube', async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).json({ error: 'URL required' });
 
-    // Try a sequence of proxies (up to 5 attempts)
-    for (let attempt = 0; attempt < 5; attempt++) {
-        const proxy = getNextProxy();
-        if (!proxy) break;
-        console.log(`Trying proxy ${attempt + 1}: ${proxy}`);
-        try {
-            // Use yt-dlp with proxy to get video info + direct URL
-            const json = await ytDlp(['--dump-json', '--no-playlist', url], proxy);
-            const info = JSON.parse(json);
-            const format = (info.formats || []).filter(f => f.acodec !== 'none' && f.vcodec !== 'none')
-                .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
-            if (format) {
-                const directUrl = await ytDlp(['-f', format.format_id, '-g', url], proxy);
-                return res.json({ title: info.title, thumbnail: info.thumbnail, downloadUrl: directUrl });
-            }
-        } catch (e) {
-            console.warn(`Proxy ${proxy} failed:`, e.message);
-        }
+    // 1. LucasDev
+    const lucas = await tryLucasDev(url);
+    if (lucas) return res.json(lucas);
+
+    // 2. Invidious
+    const idMatch = url.match(/(?:v=|\/)([a-zA-Z0-9_-]{11})(?:&|$|\/|\.)/) || url.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
+    if (idMatch) {
+        const invidious = await tryInvidious(idMatch[1]);
+        if (invidious) return res.json(invidious);
     }
 
-    // If all proxies fail, try Cobalt as last resort
+    // 3. Cobalt
     const cobalt = await tryCobalt(url);
     if (cobalt) return res.json(cobalt);
 
-    res.status(500).json({ error: 'All YouTube extraction methods exhausted. Please try again later.' });
+    res.status(500).json({ error: 'All YouTube extraction methods failed. Please try again later.' });
 });
 
 // ---------- TikTok (unchanged) ----------
@@ -135,7 +145,7 @@ app.get('/api/tiktok', async (req, res) => {
     if (!url) return res.status(400).json({ error: 'URL required' });
     try {
         const apiUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`;
-        const resp = await fetch(apiUrl);
+        const resp = await fetchWithTimeout(apiUrl);
         const data = await resp.json();
         if (data.code !== 0 || !data.data) throw new Error(data.msg || 'TikTok API error');
         const v = data.data;
@@ -151,7 +161,7 @@ app.get('/api/tiktok', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ---------- Facebook / general (unchanged) ----------
+// ---------- Facebook / general (yt-dlp restored) ----------
 const cache = new Map();
 app.get('/api/info', async (req, res) => {
     const { url, format } = req.query;
@@ -192,7 +202,7 @@ app.get('/api/proxy-download', async (req, res) => {
     const { url, title, ext } = req.query;
     if (!url) return res.status(400).send('Missing URL');
     try {
-        const videoResp = await fetch(url);
+        const videoResp = await fetchWithTimeout(url, {}, 15000);
         if (!videoResp.ok) throw new Error(`CDN returned ${videoResp.status}`);
         const fileName = (title || 'video').replace(/[^a-zA-Z0-9\s]/g, '').trim() + '.' + (ext || 'mp4');
         res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
