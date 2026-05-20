@@ -10,6 +10,11 @@ app.use(express.json());
 
 // Health check (so Render doesn't think it's dead)
 app.get('/', (req, res) => res.send('MediaForge backend is running'));
+const fs = require('fs');
+if (process.env.YOUTUBE_COOKIES) {
+    fs.writeFileSync('./cookies.txt', process.env.YOUTUBE_COOKIES);
+    console.log('Cookies file ready');
+}
 
 // ========== yt-dlp helper (with JS runtime & Android client) ==========
 function ytDlp(args) {
@@ -17,7 +22,7 @@ function ytDlp(args) {
         const ytDlpPath = './yt-dlp';
         const fullArgs = [
             '--js-runtime', 'node',
-            '--extractor-args', 'youtube:player_client=android',
+            '--cookies', './cookies.txt',   // ⭐ use your real cookies
             ...args
         ];
         execFile(ytDlpPath, fullArgs, { maxBuffer: 20 * 1024 * 1024 }, (error, stdout, stderr) => {
