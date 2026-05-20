@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const { execFile } = require('child_process');
-const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -9,33 +8,32 @@ app.use(cors());
 app.use(express.json());
 app.get('/', (req, res) => res.send('MediaForge backend is running'));
 
-// Write cookies if present
-if (process.env.YOUTUBE_COOKIES) {
-    fs.writeFileSync('./cookies.txt', process.env.YOUTUBE_COOKIES);
-    console.log('Cookies file written');
-}
-
-// ---------- yt-dlp helper (uses cookies, no proxy) ----------
+// Helper function for yt-dlp (no cookies, just proxy)
 function ytDlp(args) {
     return new Promise((resolve, reject) => {
         const ytDlpPath = './yt-dlp';
         const fullArgs = [
             '--no-warnings', '--no-playlist',
-            '--socket-timeout', '20',
-            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            '--socket-timeout', '30',
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            '--extractor-args', 'youtube:player_client=android',
         ];
-        if (fs.existsSync('./cookies.txt')) {
-            fullArgs.push('--cookies', './cookies.txt');
+
+        // Use the residential proxy from the environment variable
+        if (process.env.YTDLP_PROXY) {
+            fullArgs.push('--proxy', process.env.YTDLP_PROXY);
         }
+
         fullArgs.push(...args);
-        execFile(ytDlpPath, fullArgs, { timeout: 25000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+
+        execFile(ytDlpPath, fullArgs, { timeout: 30000, maxBuffer: 15 * 1024 * 1024 }, (err, stdout, stderr) => {
             if (err) return reject(new Error(stderr || err.message));
             resolve(stdout.trim());
         });
     });
 }
 
-// ---------- Fetch with timeout ----------
+// Simple fetch helper with timeout
 function fetchWithTimeout(url, options = {}, timeout = 15000) {
     return new Promise((resolve, reject) => {
         const controller = new AbortController();
@@ -46,11 +44,12 @@ function fetchWithTimeout(url, options = {}, timeout = 15000) {
     });
 }
 
-// ---------- YouTube ----------
+// YouTube endpoint (uses proxy)
 app.get('/api/youtube', async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).json({ error: 'URL required' });
     try {
+        // Get video info and direct download URL
         const json = await ytDlp(['--dump-single-json', url]);
         const info = JSON.parse(json);
         const formats = (info.formats || [])
@@ -70,7 +69,7 @@ app.get('/api/youtube', async (req, res) => {
     }
 });
 
-// ---------- TikTok ----------
+// TikTok endpoint (unchanged)
 app.get('/api/tiktok', async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).json({ error: 'URL required' });
@@ -92,7 +91,7 @@ app.get('/api/tiktok', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ---------- Facebook (same cookies) ----------
+// Facebook endpoint (uses proxy)
 const cache = new Map();
 app.get('/api/info', async (req, res) => {
     const { url, format } = req.query;
@@ -128,7 +127,7 @@ app.get('/api/download', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ---------- PROXY DOWNLOAD (forces file save) ----------
+// PROXY DOWNLOAD (forces file save, not preview in browser)
 app.get('/api/proxy-download', async (req, res) => {
     const { url, title, ext } = req.query;
     if (!url) return res.status(400).send('Missing URL');
